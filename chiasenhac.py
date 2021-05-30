@@ -24,7 +24,8 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -43,31 +44,38 @@ def download_file(params: tuple):
     if ss is None:
         ss = requests
 
+    # somehow chiasenhac.vn doesn't like mp3 being downloaded by requests, retry is needed
+    retry = Retry(backoff_factor=0.5)
+    adapter = HTTPAdapter(max_retries=retry)
+    ss.mount('https://', adapter)
     down_page = ss.get(url, **extra_kwargs).text
     down_soup = BeautifulSoup(down_page, 'html.parser')
-    filename = down_soup.title.text.split('Download: ')[-1].split(" - ")[0] + "." + quality
+    filename = down_soup.title.text.split('Download: ')[-1].split(" - ")[0]
     filename = filename.replace(u'Tải nhạc ', '')
 
     start_time = time.time()
     logging.info("start: %s", filename)
     size = 0
     href = ""
-    all_hrefs = list(down_soup.find_all('a'))
+    all_hrefs = list(down_soup.find_all(class_="download_item"))
     for link in all_hrefs:
         href = link.get('href')
         if href \
                 and href.find('downloads') > 0 \
-                and href.find(quality) > 0:
+                and href.find('/' + str(quality)) > 0:
             splits_dot = href.split(".")
             org_ext = splits_dot[-1] if len(splits_dot) > 1 else 'mp3'
             filename = filename + f'.{org_ext}'
 
-            write_path = Path(album_path) / filename
+            quality_path = Path(album_path) / str(quality)
+            if not quality_path.exists():
+                quality_path.mkdir(parents=True)
+            write_path = Path(quality_path) / filename
             if write_path.exists():
                 logging.warn("file %s exists. overwrite.", filename)
 
             with write_path.open('wb') as f:
-                content = ss.get(href, **extra_kwargs).content
+                content = ss.get(href, timeout=10, **extra_kwargs).content
                 size = f.write(content)
             break
     else:
@@ -79,43 +87,61 @@ def download_file(params: tuple):
 
 def main(args: argparse.Namespace):
     session = requests.Session()
-    # login
-    res_init = session.get("https://chiasenhac.vn/",
-                           headers={
-                               'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:82.0) Gecko/20100101 Firefox/82.0',
-                           },
-                           **extra_kwargs)
+    # Initialize connection
+    try:
+        res_init = session.get("https://chiasenhac.vn/",
+                            headers={
+                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:82.0) Gecko/20100101 Firefox/82.0',
+                            }, timeout=5,
+                            **extra_kwargs)
+    except requests.exceptions.ReadTimeout:
+        logging.error("connection timeout")
+        return
+    except Exception as e:
+        print(e)
+        return
     text = res_init.text
     soup = BeautifulSoup(text, 'html.parser')
 
     x_csrf_token = soup.select('meta[name="csrf-token"]')[0].get('content')
 
-    res_login = session.post(
-        "https://chiasenhac.vn/login",
-        headers={
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:82.0) Gecko/20100101 Firefox/82.0',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': 'https://chiasenhac.vn/',
-            'Origin': 'https://chiasenhac.vn',
-            'DNT': '1',
-            'Host': 'chiasenhac.vn',
-            'X-CSRF-TOKEN': x_csrf_token
-        },
-        data={
-            "email": args.username,
-            "password": args.password,
-            "remember": "true"
-        },
-        **extra_kwargs)
-    if res_login.ok \
-            and res_login.status_code == 200 \
-            and res_login.json().get('success'):
-        logging.info('login ok')
+    # login
+    allow_quality = ['32', '128', '320', 'm4a', 'flac']
+    if args.username is not None \
+        and args.password is not None\
+        and args.quality in allow_quality:
+        res_login = session.post(
+            "https://chiasenhac.vn/login",
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:82.0) Gecko/20100101 Firefox/82.0',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': 'https://chiasenhac.vn/',
+                'Origin': 'https://chiasenhac.vn',
+                'DNT': '1',
+                'Host': 'chiasenhac.vn',
+                'X-CSRF-TOKEN': x_csrf_token
+            },
+            data={
+                "email": args.username,
+                "password": args.password,
+                "remember": "true"
+            },
+            **extra_kwargs)
+        if res_login.ok \
+                and res_login.status_code == 200 \
+                and res_login.json().get('success'):
+            logging.info('login ok')
+        else:
+            logging.error('login not ok')
+            logging.error(res_login.text)
+            return
+    elif args.quality in allow_quality[0:2]:
+        # Check free quality
+        pass
     else:
-        logging.error('login not ok')
-        logging.error(res_login.text)
+        logging.error(args.quality + ' not exists')
         return
 
     org_page = session.get(args.url, **extra_kwargs).text
@@ -148,7 +174,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == '__main__':
-    #
+    # log to console
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -159,14 +185,13 @@ if __name__ == '__main__':
 
     current_dir = Path(__file__).parent
     parser = argparse.ArgumentParser(description='download album from chiasenhac.vn')
-    parser.add_argument('--url', '-u', dest='url', type=str, required=True,
-                        help='url of the album')
-    parser.add_argument('--username', '-U', dest='username', type=str,
+    parser.add_argument('url', type=str, help='url of the album')
+    parser.add_argument('--username', '-u', dest='username', type=str,
                         help='username to login', default=os.getenv('CSN_USERNAME', None))
     parser.add_argument('--password', '-p', dest='password', type=str,
                         help='password to login', default=os.getenv('CSN_PASSWORD', None))
     parser.add_argument('--quality', '-q', dest='quality', type=str, default='320',
-                        help='music quality, 128/320/m4a/flac')
+                        help='music quality, 32/128/320/m4a/flac')
     parser.add_argument('--threads', '-t', dest='num_threads', type=int, default=8,
                         help='number of threads')
     parser.add_argument('--output', '-o', dest='output_dir', type=str, default=str(current_dir / 'albums'),
